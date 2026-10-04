@@ -1276,7 +1276,135 @@ curl -s -X POST http://localhost:3000/api/admin/yards/current/checkpoints/1/roll
 curl -s -X POST http://localhost:3000/api/admin/reset/training -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
-## 数据持久化与重置
+## 站场状态变化审计流水（按当前站场追溯）
+
+管理员与值班员可追溯**当前站场**推演状态的每一次变化。系统对下列变化形成
+**按站场序号严格递增**的审计流水，每条记录**发生时刻、人工操作者或系统来源、
+关联编号、变更类型与前后状态摘要**：
+
+| 变更类型 `type` | 大类 | 何时记录 |
+| --- | --- | --- |
+| `route_open` | route | 进路开放（人工直接开放 / 等待自动兑现 / 定时计划复用路径） |
+| `movement_event` | movement | 走行占用、走行清空（含首段占用信号回红、逐段解锁） |
+| `route_release` | route | 进路解除（末段清空正常解除 / 延时取消到期解除 / 人工兜底解除） |
+| `waiting_fulfilled` | waiting | 等待申请自动兑现为进路实例 |
+| `cancellation_requested` | cancellation | 申请延时取消（入口信号回红、锁保留） |
+| `cancellation_released` | cancellation | 延时取消保护期满核验通过，进路解除 |
+| `cancellation_aborted` | cancellation | 延时取消终止（首段占用 / 到期核验未通过 / 实例已不存在） |
+| `blockade_created` | blockade | 发起临时封锁（落待生效） |
+| `blockade_activated` | blockade | 封锁 待生效→已生效（系统复核转换时） |
+| `blockade_ended` | blockade | 管理员结束封锁（含区段删除自动结束） |
+| `yard_paused` / `yard_resumed` | yard | 暂停 / 恢复命名演练副本 |
+| `checkpoint_rollback` | checkpoint | **界标**：副本整体回退到检查点 |
+| `yard_reset` | reset | **界标**：清空推演状态 / 培训重开 |
+
+审计原则：
+
+- **业务变更与流水同成同败**：每条流水都在引发它的业务事务内写入（暂停/恢复为
+  跨库事务，流水与注册表状态变更同事务）。业务回滚则流水回滚，不会出现
+  "业务成功但无流水"或反之。
+- **失败操作不产生条目**（校验拒绝、冲突、跳号等事务回滚，天然无流水）；
+  **幂等重传不产生条目**（走行事件同号同内容重传、重复延时取消/封锁申请等）；
+  **未改变状态的扫描不产生条目**（等待兑现扫描未兑现、封锁复核仍待生效、
+  到期扫描无可处理项、各类只读查询与预检）。
+- **回退与重置保留此前全部流水**，仅各追加一条写明界标的记录
+  （`checkpoint_rollback` / `yard_reset`，含检查点编号名称、时间平移、重置前
+  受影响对象计数摘要）；回退恢复出的业务状态**不补造历史流水**。
+- **副本创建后审计表为空**，只记录该副本自身的新变化（复制白名单不含审计表，
+  原站场旧数据不补造历史）；检查点快照/回退不替换审计表。
+- 流水按**站场物理隔离**：每条只存在于所属站场业务库，序号在本站场内从 1 递增，
+  查询只作用于当前会话所选站场，**不能串看其他站场**；原站场与各副本序号各自独立。
+
+每条流水字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `seq` | 站场内递增流水序号（即表主键） |
+| `occurredAt` / `occurredAtText` | 发生时刻（epoch 毫秒 / 本地时间文本） |
+| `type` / `category` | 细粒度变更类型 / 大类 |
+| `actor` / `actorKind` | 操作者姓名；系统动作为"系统"（`actorKind: human/system`） |
+| `source` | 系统来源：`manual` 人工 / `waiting` 等待兑现 / `plan` 定时走行 / `timer:yardN`、`server_start:yardN`、`yard_resumed`、`yard_copied`、`submit` 等系统触发路径 |
+| `refType` / `refId` | 关联对象类别（instance/waiting/cancellation/blockade/checkpoint/yard/route）与编号 |
+| `routeId` / `instanceId` | 涉及的进路编号 / 进路实例编号（便于按进路追溯） |
+| `before` / `after` | 变更前后状态摘要（对象：状态、信号、区段占用、锁闭等） |
+| `detail` | 结构化补充信息（序号、步号、时间平移、重置前计数、触发原因等） |
+| `note` | 文字说明（界标原因、来龙去脉） |
+
+### 审计流水 HTTP API（含调用示例）
+
+管理员与值班员均可查询**当前会话所选站场**的流水（管理员走 `/api/admin`，
+值班员走 `/api`；两者口径一致）。只读接口，暂停副本也可查询。
+
+**1) 按序号分页查看（序号升序，即发生先后）**
+
+```bash
+curl -s "http://localhost:3000/api/admin/audit-logs?page=1&pageSize=50" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+# 值班员：GET /api/audit-logs?page=1&pageSize=50
+```
+
+```json
+{"ok":true,
+ "entries":[
+   {"seq":1,"occurredAt":1791124000000,"occurredAtText":"2026/10/4 22:00:00",
+    "type":"route_open","category":"route","actor":"值班员甲","actorKind":"human",
+    "source":"manual","refType":"instance","refId":"1","routeId":"R1","instanceId":1,
+    "before":{"status":"none"},
+    "after":{"instanceId":1,"routeId":"R1","status":"open","signalState":"green",
+             "lockedSections":["1","3","5"],"lockedSwitches":["SW7","SW8"]},
+    "detail":{"source":"manual","lockedSections":["1","3","5"],"lockedSwitches":["SW7","SW8"]},
+    "note":"开放进路 R1（实例 #1），沿途区段与道岔已锁闭、入口信号转绿"},
+   {"seq":2,"type":"movement_event","actor":"值班员甲","actorKind":"human","source":"manual",
+    "refType":"instance","refId":"1","instanceId":1,
+    "before":{"sectionId":"1","sectionState":"free","signalState":"green"},
+    "after":{"sectionId":"1","sectionState":"occupied","signalState":"red",
+             "action":"occupy","seq":1,"nextSeq":2},
+    "detail":{"seq":1,"sectionId":"1","action":"occupy","step":1,"signalTurnedRed":true},
+    "note":"走行事件 #1 占用区段 1，列车进入首段，入口信号回红"}],
+ "page":1,"pageSize":50,"total":2,"totalPages":1,"hasPrev":false,"hasNext":false,
+ "yard":{"id":1,"name":"原站场","isOriginal":true},
+ "types":["route_open","route_release","movement_event","waiting_fulfilled",
+          "cancellation_requested","cancellation_released","cancellation_aborted",
+          "blockade_created","blockade_activated","blockade_ended",
+          "yard_paused","yard_resumed","checkpoint_rollback","yard_reset"]}
+```
+
+**2) 按变更类型筛选**（`type` 可传多个，逗号分隔；序号升序分页照常）
+
+```bash
+curl -s "http://localhost:3000/api/admin/audit-logs?type=route_open,route_release" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**3) 按关联编号筛选**（`refType` 与 `refId` 必须同时提供）
+
+```bash
+# 某条进路实例的全部变化（开放、走行、解除）
+curl -s "http://localhost:3000/api/admin/audit-logs?refType=instance&refId=12" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+# 某笔延时取消 / 等待 / 封锁 / 检查点
+curl -s "http://localhost:3000/api/admin/audit-logs?refType=cancellation&refId=3" -H "Authorization: Bearer $ADMIN_TOKEN"
+curl -s "http://localhost:3000/api/admin/audit-logs?refType=waiting&refId=7"      -H "Authorization: Bearer $ADMIN_TOKEN"
+curl -s "http://localhost:3000/api/admin/audit-logs?refType=blockade&refId=2"     -H "Authorization: Bearer $ADMIN_TOKEN"
+curl -s "http://localhost:3000/api/admin/audit-logs?refType=checkpoint&refId=1"  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+查询参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `page` | 页码，从 1 开始（默认 1） |
+| `pageSize` | 每页条数，1~200（默认 50） |
+| `type` | 细粒度变更类型；多个用逗号分隔（见上表/响应中的 `types`） |
+| `refType` + `refId` | 按关联对象类别 + 编号筛选，两者必须同时提供 |
+
+非法筛选明确拒绝（**400**，不返回任何流水）：`type` 不在白名单或含非法值、
+`refType` 不在白名单、只给 `refType`/`refId` 之一、`page`/`pageSize` 非正整数或
+越界，分别返回 `AUDIT_FILTER_INVALID` / `AUDIT_PAGE_INVALID`。未登录返回 401；
+管理员令牌不能查值班员接口（403），反之亦然。站场隔离由会话当前站场保证，
+任何参数都无法跨站场查询。
+
+
 
 - **多站场存储**：主库（默认卷内 `/data/interlock.db`）只保存**站场注册表 `yards`
   （含 `status`、暂停人/暂停时刻、最近恢复人/时刻）与登录会话 `sessions`
@@ -1288,8 +1416,9 @@ curl -s -X POST http://localhost:3000/api/admin/reset/training -H "Authorization
   启动会自动把旧主库中的全部业务数据（含历史交接单）整体迁移为原站场业务库，旧表保留。
 - 每个站场的拓扑、状态、事件、进路实例、**等待申请、延时取消申请与保护时长设置、
   定时走行计划与步骤、临时封锁申请、交接班交接单、检查点（具名快照与状态摘要）、
-  学员考核（场次、逐项目标、实例登记与有效用时）**
-  都在对应业务库中，刷新/重启后恢复。
+  学员考核（场次、逐项目标、实例登记与有效用时）、状态变化审计流水（按本站场序号递增）**
+  都在对应业务库中，刷新/重启后恢复。审计表不随副本复制、不参与检查点快照替换、
+  不被回退/重置清空（仅追加界标）。
 - 管理员页面"推演管理"提供：**清空推演状态**（删除进路实例/事件，区段恢复为未知、
   道岔回 N，保留站场图；同时撤销全部未兑现等待申请、**清除全部延时取消申请、活动定时
   走行计划与临时封锁记录、使未签收交接单过期（已签收单保留供复盘）、终止进行中的学员
@@ -1337,6 +1466,7 @@ curl -s -X POST http://localhost:3000/api/admin/reset/training -H "Authorization
 │   ├── blockade.js            # 临时封锁（发起/结束/待生效复核/重置清除）
 │   ├── handover.js            # 交接班交接单（生成原子快照/签收同事务比对/过期/重置与重启）
 │   ├── exam.js                # 学员考核（开考/开放登记与偏差/正常解除推进/交卷/暂停冻结用时/回退重置终止）
+│   ├── audit.js               # 站场状态变化审计流水（同事务写入/按序号分页/类型与关联编号筛选/站场隔离）
 │   └── routes/
 │       ├── auth.js            # 登录/登出；GET /auth/yards、PUT /auth/yard 选择当前站场
 │       ├── admin.js           # 含副本创建/暂停恢复、保护时长、封锁、进路批量变更集（预览/发布）、重置（均作用于当前站场）
@@ -1353,13 +1483,14 @@ curl -s -X POST http://localhost:3000/api/admin/reset/training -H "Authorization
     ├── pause-http.cjs        # 副本暂停/恢复 HTTP 端到端测试（写操作拒绝/冻结计时/退出撤销/重启/幂等）
     ├── checkpoint-http.cjs   # 检查点 HTTP 端到端测试（创建/重名/回退恢复/交接单过期/序列水位/时间冻结/重启）
     ├── route-changeset-http.cjs # 进路批量变更集 HTTP 端到端测试（预览逐条结果/受影响等待/修订标识/同事务重验/变化拒绝/开放与暂停阻断/重启标识失效）
-    └── exam-http.cjs         # 学员考核 HTTP 端到端测试（开考校验/重复开考/目标推进/偏差不补算/他人不计/幂等/等待兑现与定时走行计入/延时取消不算完成/暂停冻结用时/回退与重置终止/成绩保留重启/跨副本隔离）
+    ├── exam-http.cjs         # 学员考核 HTTP 端到端测试（开考校验/重复开考/目标推进/偏差不补算/他人不计/幂等/等待兑现与定时走行计入/延时取消不算完成/暂停冻结用时/回退与重置终止/成绩保留重启/跨副本隔离）
+    └── audit-http.cjs        # 审计流水 HTTP 端到端测试（字段齐全/同成同败/失败与幂等与无变化扫描不记录/分页与非法筛选/回退重置界标/副本独立不串看）
 ```
 
 ## 测试
 
 ```bash
-npm test             # 联锁冒烟 + 等待 + 延时取消 + 临时封锁 + 交接班 + 命名副本 + 定时走行计划 + 暂停恢复 + 检查点 + 进路批量变更集 + 学员考核端到端
+npm test             # 联锁冒烟 + 等待 + 延时取消 + 临时封锁 + 交接班 + 命名副本 + 定时走行计划 + 暂停恢复 + 检查点 + 进路批量变更集 + 学员考核 + 审计流水端到端
 npm run smoke        # 联锁核心规则
 npm run test:waiting# 等待申请提交/撤销/顺位/自动兑现/失效/重启
 npm run test:cancel  # 延时取消申请/重复幂等/到期解除/首段占用终止/区段占用终止/重启/重置
@@ -1371,4 +1502,5 @@ npm run test:pause  # 原站场不可暂停/写操作拒绝/定时任务冻结/�
 npm run test:checkpoint # 检查点创建/重名拒绝/查看摘要/整体回退/交接单过期保留/序列水位不冲突/剩余时间冻结/已到期复核/跨重启
 npm run test:changeset # 进路批量变更集预览/逐条结果/受影响等待/修订标识变化拒绝/开放与暂停阻断/整批原子性/重启标识失效/单条编辑与排路不受影响
 npm run test:exam    # 学员考核：原站场拒考/开考固定/重复开考拒绝/顺序目标推进/偏差不补算/他人不计/幂等重传/等待兑现与定时走行计入/延时取消与人工释放不算完成/暂停冻结有效用时/回退与重置终止/已交卷成绩保留/重启可查/跨副本隔离
+npm run test:audit   # 审计流水：字段齐全/同事务同成同败/失败与幂等重传与无变化扫描不记录/系统来源/暂停恢复与回退重置界标/分页与类型及关联编号筛选/非法筛选拒绝/副本独立不串看
 ```

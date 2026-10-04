@@ -14,6 +14,7 @@ const pause = require('../pause');
 const checkpoint = require('../checkpoint');
 const routeChangeset = require('../route-changeset');
 const exam = require('../exam');
+const audit = require('../audit');
 const { withYard } = require('../db');
 
 const router = express.Router();
@@ -61,6 +62,31 @@ function wrap(fn) {
 
 router.get('/state', (req, res) => {
   res.json({ ok: true, state: getState(), yard: req.yard });
+});
+
+/* ----------------------------- 站场审计流水 ----------------------------- */
+
+// 查询当前站场的状态变化审计流水（管理员）：按序号升序分页；可按细粒度 type
+// （逗号分隔多个）与关联对象 refType+refId 筛选；只读当前站场，不串看其他站场；
+// 非法筛选/分页参数返回 400 AUDIT_FILTER_INVALID / AUDIT_PAGE_INVALID。
+router.get('/audit-logs', (req, res, next) => {
+  try {
+    const result = audit.listEntries({
+      type: req.query.type,
+      refType: req.query.refType,
+      refId: req.query.refId,
+      page: req.query.page,
+      pageSize: req.query.pageSize
+    });
+    res.json({
+      ok: true,
+      ...result,
+      yard: { id: req.yard.id, name: req.yard.name, isOriginal: req.yard.isOriginal },
+      types: audit.TYPES,
+      categories: audit.CATEGORIES,
+      refTypes: audit.REF_TYPES
+    });
+  } catch (e) { next(e); }
 });
 
 /* ----------------------------- 命名演练副本 ----------------------------- */
@@ -535,7 +561,10 @@ router.post('/blockades/:id/end', wrap((req, res) => {
  */
 router.post('/reset/state', wrap((req, res) => {
   const db = getDb();
+  let before;
   db.transaction(() => {
+    // 先统计受影响对象（界标的 before 摘要），随后执行重置
+    before = audit.resetCountersInTxn();
     // 先清除待处理的延时取消申请（随后删除实例也会级联清除，这里显式清理语义清晰）
     cancellation.clearAllByReset();
     // 清除活动定时走行计划（随后删除实例也会级联清除，这里显式清理语义清晰）
@@ -551,6 +580,20 @@ router.post('/reset/state', wrap((req, res) => {
     handover.expireAllActiveByReset('state');
     // 站场重置：进行中的考核终止并记录原因（已交卷成绩保留可查）
     exam.terminateActiveInTxn('管理员清空推演状态（重置），进行中的考核终止；已交卷成绩保留');
+    // 审计界标：重置保留此前全部流水，仅追加一条 yard_reset 界标；
+    // 被批量清除的等待/取消/封锁/计划不逐条补写，统一以 before 计数摘要说明。
+    audit.recordInTxn({
+      type: 'yard_reset',
+      actor: req.session.name, actorKind: 'human', source: 'manual',
+      refType: 'yard', refId: req.yard.id,
+      before,
+      after: { mode: 'reset_state',
+        sectionState: 'unknown', switchPosition: 'N',
+        openInstances: 0, waiting: 0, pendingCancellations: 0,
+        unfinishedBlockades: 0, activeMovementPlans: 0 },
+      detail: { resetKind: 'state', yardId: req.yard.id, yardName: req.yard.name, before },
+      note: `管理员 ${req.session.name} 清空站场「${req.yard.name}」的推演状态：进路实例/锁/事件删除，区段恢复未知、道岔回 N，等待/延时取消/封锁/活动计划清除，未签收交接单过期、进行中考核终止；拓扑保留，此前审计流水全部保留`
+    });
   })();
   res.json({ ok: true, state: getState() });
 }));
@@ -561,7 +604,9 @@ router.post('/reset/state', wrap((req, res) => {
  */
 router.post('/reset/training', wrap((req, res) => {
   const db = getDb();
+  let before;
   db.transaction(() => {
+    before = audit.resetCountersInTxn();
     cancellation.clearAllByReset();
     movementPlan.clearAllByReset();
     db.prepare(`DELETE FROM route_instances`).run();
@@ -575,6 +620,19 @@ router.post('/reset/training', wrap((req, res) => {
     handover.expireAllActiveByReset('training');
     // 培训重开（站场重置）：进行中的考核终止并记录原因（已交卷成绩保留）
     exam.terminateActiveInTxn('管理员执行培训重开（站场重置），进行中的考核终止；已交卷成绩保留');
+    // 审计界标：培训重开（保留此前全部流水，仅追加界标）
+    audit.recordInTxn({
+      type: 'yard_reset',
+      actor: req.session.name, actorKind: 'human', source: 'manual',
+      refType: 'yard', refId: req.yard.id,
+      before,
+      after: { mode: 'training_restart',
+        sectionState: 'free', switchPosition: 'N',
+        openInstances: 0, waiting: 0, pendingCancellations: 0,
+        unfinishedBlockades: 0, activeMovementPlans: 0 },
+      detail: { resetKind: 'training', yardId: req.yard.id, yardName: req.yard.name, before },
+      note: `管理员 ${req.session.name} 对站场「${req.yard.name}」执行培训重开（恢复示例初始状态）：进路实例/锁/事件删除，区段全部空闲、道岔回 N，等待/延时取消/封锁/活动计划清除，未签收交接单过期、进行中考核终止；此前审计流水全部保留`
+    });
   })();
   res.json({ ok: true, state: getState() });
 }));

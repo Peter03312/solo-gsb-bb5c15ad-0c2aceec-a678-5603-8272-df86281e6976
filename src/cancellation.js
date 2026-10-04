@@ -114,8 +114,24 @@ function requestCancellation(instanceId, clientName) {
     // 同一事务内停止计划（人工/取消结果保留，不让计划随后继续注入）。
     require('./movement-plan').abortActiveByCancellationInTxn(instanceId);
 
+    const createdRow = db.prepare(`SELECT * FROM cancellation_applications WHERE id=?`).get(info.lastInsertRowid);
+
+    // 审计流水：延时取消申请（与申请落库、信号回红同一事务）
+    require('./audit').recordInTxn({
+      type: 'cancellation_requested',
+      actor: clientName, actorKind: 'human', source: 'manual',
+      refType: 'cancellation', refId: info.lastInsertRowid,
+      routeId: inst.route_id, instanceId,
+      before: { signalState: 'green', cancellation: 'none' },
+      after: { cancellationId: info.lastInsertRowid, status: 'pending',
+        signalState: 'red', durationSeconds: seconds, releaseAt: now + seconds * 1000 },
+      detail: { cancellationId: info.lastInsertRowid, instanceId,
+        durationSeconds: seconds, requestedAt: now, releaseAt: now + seconds * 1000 },
+      note: `值班员 ${clientName} 对进路实例 #${instanceId} 申请延时取消：入口信号立即回红，区段与道岔锁保留，最早解除时刻 ${new Date(now + seconds * 1000).toLocaleString('zh-CN', { hour12: false })}`
+    });
+
     return {
-      row: db.prepare(`SELECT * FROM cancellation_applications WHERE id=?`).get(info.lastInsertRowid),
+      row: createdRow,
       created: true
     };
   });
@@ -131,17 +147,30 @@ function requestCancellation(instanceId, clientName) {
  * 若该实例有 pending 的延时取消申请，标记为 aborted，保留锁闭并写明原因。
  * 返回被终止的申请编号（无则 null）。
  */
-function abortPendingByOccupyInTxn(instanceId) {
+function abortPendingByOccupyInTxn(instanceId, clientName = null, eventSource = 'manual') {
   const db = getDb();
   const row = db.prepare(
     `SELECT * FROM cancellation_applications WHERE instance_id=? AND status='pending'`
   ).get(instanceId);
   if (!row) return null;
+  const reason = '保护期内收到首段走行占用事件，取消申请终止；区段与道岔锁继续保留，按正常走行逐段解锁';
   db.prepare(
     `UPDATE cancellation_applications SET status='aborted', processed_at=?,
-            end_reason='保护期内收到首段走行占用事件，取消申请终止；区段与道岔锁继续保留，按正常走行逐段解锁'
-      WHERE id=?`
-  ).run(Date.now(), row.id);
+            end_reason=? WHERE id=?`
+  ).run(Date.now(), reason, row.id);
+  // 审计流水：延时取消因首段占用而终止（锁闭保留）
+  require('./audit').recordInTxn({
+    type: 'cancellation_aborted',
+    actor: clientName || '系统',
+    actorKind: eventSource === 'plan' ? 'system' : (clientName ? 'human' : 'system'),
+    source: eventSource === 'plan' ? 'plan' : 'manual',
+    refType: 'cancellation', refId: row.id,
+    instanceId,
+    before: { cancellationId: row.id, status: 'pending' },
+    after: { cancellationId: row.id, status: 'aborted' },
+    detail: { cancellationId: row.id, instanceId, reason: 'first_occupy' },
+    note: `延时取消申请 #${row.id}：保护期内收到首段走行占用事件而终止，锁闭保留，继续按正常走行处理`
+  });
   return row.id;
 }
 
@@ -149,11 +178,16 @@ function abortPendingByOccupyInTxn(instanceId) {
 
 /**
  * 处理单个到期申请（事务体）：在同一事务内重查全部解除条件。
+ * @param {Object} row 到期申请行
+ * @param {string} trigger 触发来源标记（timer/server_start/yard_resumed/yard_copied）
  * @returns {{released:boolean, aborted:boolean, reason?:string}}
  */
-function processOneInTxn(row) {
+function processOneInTxn(row, trigger = 'timer') {
   const db = getDb();
   const now = require('./pause').effectiveNow();
+  const audit = require('./audit');
+  // 系统到期处理：动作为"系统"，来源按触发路径标注（定时扫描/重启/恢复/副本创建）
+  const sysActor = { actor: '系统', actorKind: 'system', source: trigger };
 
   const inst = db.prepare(`SELECT * FROM route_instances WHERE id=?`).get(row.instance_id);
 
@@ -163,6 +197,14 @@ function processOneInTxn(row) {
       `UPDATE cancellation_applications SET status='aborted', processed_at=?,
               end_reason='进路实例已不存在' WHERE id=?`
     ).run(now, row.id);
+    audit.recordInTxn({
+      type: 'cancellation_aborted', ...sysActor,
+      refType: 'cancellation', refId: row.id, instanceId: row.instance_id,
+      before: { cancellationId: row.id, status: 'pending' },
+      after: { cancellationId: row.id, status: 'aborted' },
+      detail: { cancellationId: row.id, reason: 'instance_missing', trigger },
+      note: `延时取消申请 #${row.id} 到期处理时进路实例已不存在，终止`
+    });
     return { aborted: true, reason: '进路实例已不存在' };
   }
 
@@ -172,6 +214,15 @@ function processOneInTxn(row) {
       `UPDATE cancellation_applications SET status='released', processed_at=?,
               end_reason='进路在到期处理前已解除（走行/人工解除）' WHERE id=?`
     ).run(now, row.id);
+    audit.recordInTxn({
+      type: 'cancellation_released', ...sysActor,
+      refType: 'cancellation', refId: row.id,
+      routeId: inst.route_id, instanceId: inst.id,
+      before: { cancellationId: row.id, status: 'pending' },
+      after: { cancellationId: row.id, status: 'released', instanceStatus: inst.status },
+      detail: { cancellationId: row.id, reason: 'already_released', trigger },
+      note: `延时取消申请 #${row.id} 到期处理时进路实例 #${inst.id} 已解除，按已解除收尾`
+    });
     return { released: true, already: true };
   }
 
@@ -185,6 +236,16 @@ function processOneInTxn(row) {
     db.prepare(
       `UPDATE cancellation_applications SET status='aborted', processed_at=?, end_reason=? WHERE id=?`
     ).run(now, reason, row.id);
+    audit.recordInTxn({
+      type: 'cancellation_aborted', ...sysActor,
+      refType: 'cancellation', refId: row.id,
+      routeId: inst.route_id, instanceId: inst.id,
+      before: { cancellationId: row.id, status: 'pending' },
+      after: { cancellationId: row.id, status: 'aborted' },
+      detail: { cancellationId: row.id, reason: 'occupancy_exists',
+        firstSection: occ.section_id, trigger },
+      note: `延时取消申请 #${row.id} 到期核验未通过：保护期内首段区段 ${occ.section_id} 已占用，终止，锁闭保留`
+    });
     return { aborted: true, reason };
   }
 
@@ -200,6 +261,15 @@ function processOneInTxn(row) {
     db.prepare(
       `UPDATE cancellation_applications SET status='aborted', processed_at=?, end_reason=? WHERE id=?`
     ).run(now, reason, row.id);
+    audit.recordInTxn({
+      type: 'cancellation_aborted', ...sysActor,
+      refType: 'cancellation', refId: row.id,
+      routeId: inst.route_id, instanceId: inst.id,
+      before: { cancellationId: row.id, status: 'pending' },
+      after: { cancellationId: row.id, status: 'aborted' },
+      detail: { cancellationId: row.id, reason: 'route_without_sections', trigger },
+      note: `延时取消申请 #${row.id} 到期核验未通过：进路 ${inst.route_id} 已无区段定义，终止，锁闭保留`
+    });
     return { aborted: true, reason };
   }
   const bad = steps.find((s) => s.occ_state !== 'free');
@@ -210,6 +280,16 @@ function processOneInTxn(row) {
     db.prepare(
       `UPDATE cancellation_applications SET status='aborted', processed_at=?, end_reason=? WHERE id=?`
     ).run(now, reason, row.id);
+    audit.recordInTxn({
+      type: 'cancellation_aborted', ...sysActor,
+      refType: 'cancellation', refId: row.id,
+      routeId: inst.route_id, instanceId: inst.id,
+      before: { cancellationId: row.id, status: 'pending' },
+      after: { cancellationId: row.id, status: 'aborted' },
+      detail: { cancellationId: row.id, reason: 'section_not_free',
+        sectionId: bad.section_id, sectionState: bad.occ_state, trigger },
+      note: `延时取消申请 #${row.id} 到期核验未通过：沿途区段 ${bad.section_id} 当前${stateText}，终止，锁闭保留`
+    });
     return { aborted: true, reason };
   }
 
@@ -224,6 +304,27 @@ function processOneInTxn(row) {
             end_reason='保护期满且核验通过（进路仍开放、无走行占用、沿途区段均空闲），进路已解除'
       WHERE id=?`
   ).run(now, row.id);
+  audit.recordInTxn({
+    type: 'cancellation_released', ...sysActor,
+    refType: 'cancellation', refId: row.id,
+    routeId: inst.route_id, instanceId: inst.id,
+    before: { cancellationId: row.id, status: 'pending',
+      instanceStatus: 'open', signalState: inst.signal_state },
+    after: { cancellationId: row.id, status: 'released',
+      instanceStatus: 'released', signalState: 'red' },
+    detail: { cancellationId: row.id, reason: 'protection_passed', trigger,
+      durationSeconds: row.duration_seconds },
+    note: `延时取消申请 #${row.id} 保护期满且核验通过（进路仍开放、无走行占用、沿途区段均空闲），进路实例 #${inst.id} 已解除`
+  });
+  audit.recordInTxn({
+    type: 'route_release', ...sysActor,
+    refType: 'instance', refId: inst.id,
+    routeId: inst.route_id, instanceId: inst.id,
+    before: { status: 'open', signalState: inst.signal_state },
+    after: { status: 'released', signalState: 'red', releaseReason: 'delayed_cancellation' },
+    detail: { reason: 'delayed_cancellation', cancellationId: row.id, trigger },
+    note: `进路 ${inst.route_id}（实例 #${inst.id}）因延时取消申请 #${row.id} 保护期满核验通过而解除`
+  });
   return { released: true };
 }
 
@@ -242,7 +343,7 @@ function processDue(trigger = 'timer') {
   const released = [];
   const aborted = [];
   for (const row of due) {
-    const txn = db.transaction((r) => processOneInTxn(r));
+    const txn = db.transaction((r) => processOneInTxn(r, trigger));
     let res;
     try {
       res = txn(row);

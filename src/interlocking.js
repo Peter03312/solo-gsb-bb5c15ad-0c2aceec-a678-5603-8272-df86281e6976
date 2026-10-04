@@ -294,6 +294,33 @@ function openRouteInTxn(routeId, switchPositions, clientName, source = 'manual')
   // 登记该开考后新实例并判定顺序挂接/偏差；无考核时为空操作。随主事务提交。
   require('./exam').recordOpenInTxn(instanceId, routeId, clientName, source);
 
+  // 审计流水：进路开放（人工直接开放 / 等待申请自动兑现 / 定时计划触发的复用
+  // 路径统一记录；与开放同事务，回滚则流水一并回滚）。
+  const auditSource = source === 'waiting' ? 'waiting' : (source === 'plan' ? 'plan' : 'manual');
+  require('./audit').recordInTxn({
+    type: 'route_open',
+    actor: clientName,
+    actorKind: auditSource === 'manual' ? 'human' : 'system',
+    source: auditSource,
+    refType: 'instance', refId: instanceId,
+    routeId, instanceId,
+    before: { status: 'none' },
+    after: {
+      instanceId, routeId, status: 'open', signalState: 'green',
+      lockedSections: steps.map((s) => s.section_id),
+      lockedSwitches: reqs.map((r) => r.switch_id),
+      openedBy: clientName
+    },
+    detail: {
+      source: auditSource,
+      lockedSections: steps.map((s) => s.section_id),
+      lockedSwitches: reqs.map((r) => r.switch_id)
+    },
+    note: auditSource === 'waiting'
+      ? `等待申请自动兑现开放进路 ${routeId}（实例 #${instanceId}）`
+      : `开放进路 ${routeId}（实例 #${instanceId}），沿途区段与道岔已锁闭、入口信号转绿`
+  });
+
   return instanceId;
 }
 
@@ -456,8 +483,30 @@ function submitSectionEventInTxn(instanceId, seq, sectionId, action, clientName,
     // 首段占用：若该实例有 pending 的延时取消申请，同一事务内终止（锁闭保留）
     let cancellationAborted = null;
     if (step.step_order === 1) {
-      cancellationAborted = require('./cancellation').abortPendingByOccupyInTxn(instanceId);
+      cancellationAborted = require('./cancellation').abortPendingByOccupyInTxn(instanceId, clientName, source);
     }
+
+    // 审计流水：走行占用事件（幂等重传在上方已提前 return，不会到这里）
+    require('./audit').recordInTxn({
+      type: 'movement_event',
+      actor: clientName,
+      actorKind: source === 'plan' ? 'system' : 'human',
+      source: source === 'plan' ? 'plan' : 'manual',
+      refType: 'instance', refId: instanceId,
+      routeId: inst.route_id, instanceId,
+      before: { sectionId, sectionState: 'free',
+        ...(step.step_order === 1 ? { signalState: 'green' } : {}), nextSeq: seq },
+      after: {
+        sectionId, sectionState: 'occupied', action: 'occupy', seq,
+        ...(step.step_order === 1 ? { signalState: 'red' } : {}),
+        nextSeq: seq + 1, headStep: inst.head_step + 1
+      },
+      detail: { seq, sectionId, action: 'occupy', step: step.step_order,
+        signalTurnedRed: step.step_order === 1, cancellationAborted },
+      note: `${source === 'plan' ? '定时走行计划自动注入：' : ''}走行事件 #${seq} 占用区段 ${sectionId}` +
+        (step.step_order === 1 ? '，列车进入首段，入口信号回红' : '') +
+        (cancellationAborted ? `，延时取消申请 #${cancellationAborted} 终止` : '')
+    });
 
     return { idempotent: false, instanceId, seq, sectionId, action,
       signalTurnedRed: step.step_order === 1, cancellationAborted };
@@ -494,6 +543,34 @@ function submitSectionEventInTxn(instanceId, seq, sectionId, action, clientName,
        WHERE id=?`
     ).run(instanceId);
     db.prepare(`DELETE FROM route_locks WHERE instance_id=?`).run(instanceId);
+
+    // 审计流水：末段清空走行事件
+    require('./audit').recordInTxn({
+      type: 'movement_event',
+      actor: clientName,
+      actorKind: source === 'plan' ? 'system' : 'human',
+      source: source === 'plan' ? 'plan' : 'manual',
+      refType: 'instance', refId: instanceId,
+      routeId: inst.route_id, instanceId,
+      before: { sectionId, sectionState: 'occupied', nextSeq: seq },
+      after: { sectionId, sectionState: 'free', action: 'clear', seq, nextSeq: seq + 1 },
+      detail: { seq, sectionId, action: 'clear', step: step.step_order },
+      note: `${source === 'plan' ? '定时走行计划自动注入：' : ''}走行事件 #${seq} 清空末段区段 ${sectionId}，该区段逐段解锁`
+    });
+    // 审计流水：进路随末段清空正常解除
+    require('./audit').recordInTxn({
+      type: 'route_release',
+      actor: clientName,
+      actorKind: source === 'plan' ? 'system' : 'human',
+      source: source === 'plan' ? 'plan' : 'manual',
+      refType: 'instance', refId: instanceId,
+      routeId: inst.route_id, instanceId,
+      before: { status: 'open', signalState: 'red', tailStep: inst.tail_step },
+      after: { status: 'released', signalState: 'red', releaseReason: 'walkthrough' },
+      detail: { reason: 'walkthrough', lastSeq: seq, lastSection: sectionId },
+      note: `末段区段 ${sectionId} 清空，进路 ${inst.route_id}（实例 #${instanceId}）逐段走行完毕，正常解除`
+    });
+
     // 考核计数（同一事务内）：逐段走行【正常解除】才推进当前目标；人工释放/
     // 延时取消解除不经过此路径；幂等重传在上面的历史事件分支已提前返回。
     const examResult = require('./exam').recordWalkthroughReleaseInTxn(instanceId);
@@ -503,6 +580,22 @@ function submitSectionEventInTxn(instanceId, seq, sectionId, action, clientName,
   db.prepare(
     `UPDATE route_instances SET next_seq=next_seq+1, tail_step=tail_step+1 WHERE id=?`
   ).run(instanceId);
+
+  // 审计流水：中间区段清空（逐段解锁，进路仍开放）
+  require('./audit').recordInTxn({
+    type: 'movement_event',
+    actor: clientName,
+    actorKind: source === 'plan' ? 'system' : 'human',
+    source: source === 'plan' ? 'plan' : 'manual',
+    refType: 'instance', refId: instanceId,
+    routeId: inst.route_id, instanceId,
+    before: { sectionId, sectionState: 'occupied', nextSeq: seq },
+    after: { sectionId, sectionState: 'free', action: 'clear', seq,
+      nextSeq: seq + 1, tailStep: inst.tail_step + 1 },
+    detail: { seq, sectionId, action: 'clear', step: step.step_order, sectionUnlocked: true },
+    note: `${source === 'plan' ? '定时走行计划自动注入：' : ''}走行事件 #${seq} 清空区段 ${sectionId}，该区段逐段解锁，进路仍锁闭`
+  });
+
   return { idempotent: false, instanceId, seq, sectionId, action, sectionUnlocked: true };
 }
 
@@ -532,6 +625,17 @@ function releaseInstance(instanceId, clientName) {
       `UPDATE route_instances SET status='released', released_at=datetime('now') WHERE id=?`
     ).run(instanceId);
     db.prepare(`DELETE FROM route_locks WHERE instance_id=?`).run(instanceId);
+    // 审计流水：人工/兜底解除（联锁规则下仅末段已清空的兜底情形可到这里）
+    require('./audit').recordInTxn({
+      type: 'route_release',
+      actor: clientName, actorKind: 'human', source: 'manual',
+      refType: 'instance', refId: instanceId,
+      routeId: inst.route_id, instanceId,
+      before: { status: inst.status },
+      after: { status: 'released', releaseReason: 'manual' },
+      detail: { reason: 'manual', tailStep: inst.tail_step },
+      note: `值班员人工解除进路 ${inst.route_id}（实例 #${instanceId}）`
+    });
     // 人工/兜底解除：同事务停止活动定时走行计划（人工结果保留，不覆盖）
     require('./movement-plan').abortActiveByManualInTxn(
       instanceId, '进路被人工解除，定时走行计划停止；人工结果保留');

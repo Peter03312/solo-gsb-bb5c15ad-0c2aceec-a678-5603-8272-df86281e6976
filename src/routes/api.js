@@ -9,6 +9,7 @@ const blockade = require('../blockade');
 const handover = require('../handover');
 const movementPlan = require('../movement-plan');
 const pause = require('../pause');
+const audit = require('../audit');
 const { InterlockError } = require('../interlocking');
 
 const router = express.Router();
@@ -40,6 +41,28 @@ function wrap(fn) {
 router.get('/state', (req, res) => {
   res.json({ ok: true, state: inter.getState(), me: req.session.name, yard: req.yard });
 });
+
+/* ------------------------------ 站场审计流水 ------------------------------ */
+
+// 查询当前站场的状态变化审计流水（按序号升序分页；可按 type 与关联对象筛选）。
+// 只读当前会话所选站场，天然不能串看其他站场；非法 type/refType/分页明确拒绝。
+// GET 只读：暂停副本也可查询。
+router.get('/audit-logs', wrap((req, res) => {
+  const result = audit.listEntries({
+    type: req.query.type,
+    refType: req.query.refType,
+    refId: req.query.refId,
+    page: req.query.page,
+    pageSize: req.query.pageSize
+  });
+  res.json({
+    ok: true,
+    ...result,
+    me: req.session.name,
+    yard: { id: req.yard.id, name: req.yard.name, isOriginal: req.yard.isOriginal },
+    types: audit.TYPES
+  });
+}));
 
 // 预检：不产生任何锁
 router.post('/routes/:id/check', wrap((req, res) => {

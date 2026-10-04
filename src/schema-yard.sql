@@ -382,3 +382,37 @@ CREATE TABLE IF NOT EXISTS exam_instances (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_exam_instance_unique
   ON exam_instances(exam_id, instance_id);
 CREATE INDEX IF NOT EXISTS idx_exam_instances_exam ON exam_instances(exam_id, id);
+
+-- 站场状态变化审计流水（每个站场业务库各自一份，按序号在本库内严格递增）：
+--  - 只记录"真正改变当前站场推演状态"的业务变化：进路开放、走行（占用/清空）
+--    与解除、等待申请兑现、延时取消申请/到期解除、封锁状态变更、暂停/恢复、
+--    检查点回退、站场重置；
+--  - 每条流水与引发它的业务变更在【同一事务】内写入，业务回滚则流水回滚；
+--    失败操作、幂等重传、未改变状态的扫描不产生新条目；
+--  - seq 在本站场内严格递增（独立 AUTOINCREMENT）：回退/重置不删流水，
+--    副本创建后本表为空、只记录副本自身的新变化（旧数据不补造历史）。
+-- ref_type/ref_id 为关联对象类别与编号（如 instance/12、waiting/7、blockade/2），
+-- before_state/after_state 为前后状态摘要（JSON），detail 为结构化补充信息。
+CREATE TABLE IF NOT EXISTS yard_audit_log (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT, -- 即站场内流水序号 seq
+  occurred_at  INTEGER NOT NULL,                  -- 发生时刻（epoch 毫秒）
+  type         TEXT NOT NULL,                     -- 细粒度变更类型（见 src/audit.js TYPES）
+  category     TEXT NOT NULL,                     -- 大类：route/movement/waiting/...
+  actor        TEXT NOT NULL,                     -- 人工操作者姓名；系统动作为"系统"
+  actor_kind   TEXT NOT NULL DEFAULT 'human'
+                 CHECK (actor_kind IN ('human','system')),
+  source       TEXT NOT NULL,                     -- 系统来源（manual/plan/timer/...）
+  ref_type     TEXT NOT NULL,                     -- 关联对象类别
+  ref_id       TEXT NOT NULL,                     -- 关联编号（文本，兼容被删进路编号）
+  route_id     TEXT,                              -- 涉及进路编号（便于按进路追溯）
+  instance_id  INTEGER,                           -- 涉及进路实例编号
+  before_state TEXT,                              -- 变更前状态摘要（JSON）
+  after_state  TEXT,                              -- 变更后状态摘要（JSON）
+  detail       TEXT,                              -- 结构化补充信息（JSON）
+  note         TEXT,                              -- 文字说明（界标等）
+  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_audit_type ON yard_audit_log(type, id);
+CREATE INDEX IF NOT EXISTS idx_audit_ref ON yard_audit_log(ref_type, ref_id, id);
+CREATE INDEX IF NOT EXISTS idx_audit_instance ON yard_audit_log(instance_id, id);
+CREATE INDEX IF NOT EXISTS idx_audit_time ON yard_audit_log(occurred_at, id);

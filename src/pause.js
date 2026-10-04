@@ -95,6 +95,20 @@ function pauseCurrentYard(yardId, operator) {
                   live_since = NULL
             WHERE status='in_progress'`
         ).run(now, now);
+        // 审计流水写入【被暂停副本】业务库，与暂停状态变更同事务同成同败。
+        db.prepare(
+          `INSERT INTO ${alias}.yard_audit_log
+             (occurred_at,type,category,actor,actor_kind,source,ref_type,ref_id,
+              route_id,instance_id,before_state,after_state,detail,note)
+           VALUES (?, 'yard_paused','yard', ?, 'human','manual','yard', ?,
+                   NULL,NULL, ?, ?, ?, ?)`
+        ).run(
+          now, operator, String(yardId),
+          JSON.stringify({ yardId, status: 'active', paused: false }),
+          JSON.stringify({ yardId, status: 'paused', paused: true, pausedBy: operator, pausedAt: now }),
+          JSON.stringify({ yardId, pausedBy: operator, pausedAt: now }),
+          `管理员 ${operator} 暂停命名演练副本 #${yardId}：手工变更一律拒绝，定时走行、延时取消、封锁复核与等待兑现冻结`
+        );
       })();
     } finally {
       detach();
@@ -156,6 +170,23 @@ function resumeCurrentYard(yardId, operator) {
                   paused_by=NULL, paused_at=NULL
             WHERE id=? AND status='paused'`
         ).run(operator, now, yardId);
+        // 审计流水写入【被恢复副本】业务库，与恢复状态变更、时间平移同事务。
+        db.prepare(
+          `INSERT INTO ${alias}.yard_audit_log
+             (occurred_at,type,category,actor,actor_kind,source,ref_type,ref_id,
+              route_id,instance_id,before_state,after_state,detail,note)
+           VALUES (?, 'yard_resumed','yard', ?, 'human','manual','yard', ?,
+                   NULL,NULL, ?, ?, ?, ?)`
+        ).run(
+          now, operator, String(yardId),
+          JSON.stringify({ yardId, status: 'paused', paused: true,
+            pausedBy: row.paused_by, pausedAt: row.paused_at }),
+          JSON.stringify({ yardId, status: 'active', paused: false,
+            resumedBy: operator, resumedAt: now }),
+          JSON.stringify({ yardId, resumedBy: operator, resumedAt: now, shiftMs,
+            adjusted: { movementPlanSteps: planResult.changes, cancellations: cancelResult.changes } }),
+          `管理员 ${operator} 恢复命名演练副本 #${yardId}：按暂停时长 ${shiftMs}ms 平移活动计划与延时取消到期时间，恢复后立即复核已到期事项`
+        );
         return { movementPlanSteps: planResult.changes, cancellations: cancelResult.changes };
       })();
       return {

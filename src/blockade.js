@@ -61,12 +61,13 @@ function canActivate(sectionId) {
  * 复核全部待生效封锁：区段空闲且无进路锁的转为已生效。
  * 在单个事务内逐条重查，返回本轮转为已生效的申请编号列表。
  */
-function refreshBlockadeStates(reason) {
+function refreshBlockadeStates(reason, operator = null) {
   const db = getDb();
   const activated = [];
   db.transaction(() => {
     const pendings = db.prepare(
-      `SELECT id, section_id FROM blockade_applications WHERE status='pending' ORDER BY id`
+      `SELECT id, section_id, applicant, reason FROM blockade_applications
+        WHERE status='pending' ORDER BY id`
     ).all();
     for (const b of pendings) {
       if (canActivate(b.section_id)) {
@@ -75,6 +76,21 @@ function refreshBlockadeStates(reason) {
             WHERE id=?`
         ).run(b.id);
         activated.push(b.id);
+        // 审计流水：封锁 待生效→已生效（仅在状态确有转换时记录；反复复核
+        // 未改变状态的扫描不会产生条目）。人工触发（管理员结束其他封锁后的
+        // 复核等）以触发人为动作来源，其余为系统定时/事件复核。
+        require('./audit').recordInTxn({
+          type: 'blockade_activated',
+          actor: operator || '系统',
+          actorKind: operator ? 'human' : 'system',
+          source: operator ? 'manual' : (reason || 'system'),
+          refType: 'blockade', refId: b.id,
+          before: { blockadeId: b.id, status: 'pending' },
+          after: { blockadeId: b.id, status: 'active' },
+          detail: { blockadeId: b.id, sectionId: b.section_id,
+            trigger: reason || 'system' },
+          note: `临时封锁申请 #${b.id}（区段 ${b.section_id}，原因：${b.reason}）复核通过：区段空闲且无进路锁，转为已生效`
+        });
       }
     }
   })();
@@ -121,6 +137,18 @@ function submitBlockade(sectionId, rawReason, applicant) {
         `INSERT INTO blockade_applications(section_id, applicant, reason, status)
          VALUES(?, ?, ?, 'pending')`
       ).run(sid, applicant, reason);
+      // 审计流水：发起封锁（先落待生效；提交后事务外复核可能转已生效，
+      // 转换另由 blockade_activated 记录）。
+      require('./audit').recordInTxn({
+        type: 'blockade_created',
+        actor: applicant, actorKind: 'human', source: 'manual',
+        refType: 'blockade', refId: info.lastInsertRowid,
+        before: { sectionId: sid, blockade: 'none' },
+        after: { blockadeId: info.lastInsertRowid, sectionId: sid,
+          status: 'pending', reason },
+        detail: { blockadeId: info.lastInsertRowid, sectionId: sid, reason },
+        note: `管理员 ${applicant} 对区段 ${sid} 发起临时封锁（待生效），原因：${reason}`
+      });
       return { id: info.lastInsertRowid, created: true };
     } catch (e) {
       // 并发重复申请撞到部分唯一索引：返回已有未结束申请（幂等）
@@ -165,6 +193,17 @@ function endBlockade(applicationId) {
       `UPDATE blockade_applications SET status='ended', ended_at=datetime('now'),
               end_reason='管理员结束封锁' WHERE id=?`
     ).run(applicationId);
+    // 审计流水：结束封锁
+    require('./audit').recordInTxn({
+      type: 'blockade_ended',
+      actor: '管理员', actorKind: 'human', source: 'manual',
+      refType: 'blockade', refId: applicationId,
+      before: { blockadeId: applicationId, status: row.status },
+      after: { blockadeId: applicationId, status: 'ended' },
+      detail: { blockadeId: applicationId, sectionId: row.section_id,
+        previousStatus: row.status },
+      note: `管理员结束区段 ${row.section_id} 的临时封锁申请 #${applicationId}（原状态：${row.status === 'active' ? '已生效' : '待生效'}），区段占用状态不变`
+    });
   })();
   // 封锁解除后，此前被封锁阻断的等待申请可能已满足兑现条件
   try {
@@ -182,10 +221,28 @@ function endBlockade(applicationId) {
  * 应在管理员删除区段的事务内调用。
  */
 function endBySectionDelete(sectionId) {
-  getDb().prepare(
+  const db = getDb();
+  const rows = db.prepare(
+    `SELECT id, status FROM blockade_applications
+      WHERE section_id=? AND status IN ('pending','active')`
+  ).all(sectionId);
+  db.prepare(
     `UPDATE blockade_applications SET status='ended', ended_at=datetime('now'),
             end_reason=? WHERE section_id=? AND status IN ('pending','active')`
   ).run(`区段 ${sectionId} 已被管理员删除，封锁自动结束`, sectionId);
+  // 审计流水：随区段删除而自动结束的未结束封锁（与区段删除同事务）
+  for (const b of rows) {
+    require('./audit').recordInTxn({
+      type: 'blockade_ended',
+      actor: '管理员', actorKind: 'human', source: 'manual',
+      refType: 'blockade', refId: b.id,
+      before: { blockadeId: b.id, status: b.status },
+      after: { blockadeId: b.id, status: 'ended' },
+      detail: { blockadeId: b.id, sectionId, previousStatus: b.status,
+        reason: 'section_deleted' },
+      note: `管理员删除区段 ${sectionId}，其上临时封锁申请 #${b.id}（原状态：${b.status === 'active' ? '已生效' : '待生效'}）自动结束`
+    });
+  }
 }
 
 /**

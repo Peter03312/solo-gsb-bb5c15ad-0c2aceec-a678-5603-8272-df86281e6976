@@ -261,6 +261,22 @@ function rollbackToCheckpoint(yardId, checkpointId, operator) {
     const terminatedExamId = require('./exam').terminateActiveInTxn(
       `管理员将副本回退到检查点 #${row.id}「${row.name}」，进行中的考核终止；已交卷成绩保留`);
 
+    // 7) 审计界标：回退保留此前全部流水，仅追加一条 checkpoint_rollback 界标，
+    //    写明检查点编号/名称与时间平移；回退恢复出的业务数据不补造历史流水。
+    const restoredSummary = safeParse(row.summary, {});
+    require('./audit').recordInTxn({
+      type: 'checkpoint_rollback',
+      actor: operator, actorKind: 'human', source: 'manual',
+      refType: 'checkpoint', refId: row.id,
+      before: { mode: 'current', note: '回退前的当前副本状态（详见此前流水）' },
+      after: { mode: 'checkpoint', checkpointId: row.id, checkpointName: row.name,
+        restored: restoredSummary },
+      detail: { checkpointId: row.id, checkpointName: row.name,
+        checkpointCreatedAt: row.created_at, timeShiftMs: shiftMs,
+        handoversExpired: expired, terminatedExamId, restored: restoredSummary },
+      note: `管理员 ${operator} 将副本整体回退到检查点 #${row.id}「${row.name}」：此前审计流水全部保留，回退恢复出的状态不补造历史；副本保持暂停，时间平移 ${shiftMs}ms，未签收交接单过期 ${expired} 张`
+    });
+
     return { row, shiftMs, expired, terminatedExamId };
   })();
 

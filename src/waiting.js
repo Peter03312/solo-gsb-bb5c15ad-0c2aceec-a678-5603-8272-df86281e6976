@@ -253,6 +253,18 @@ function sweepFulfillments(reason) {
         WHERE id=?`
     ).run(instanceId, app.id);
     fulfilled.push(app.id);
+    // 审计流水：等待申请兑现（与实例开放同一扫描事务；开放本身的 route_open
+    // 流水已在 openRouteInTxn 内写入，此条记录"等待申请→兑现"这一状态变化）。
+    require('./audit').recordInTxn({
+      type: 'waiting_fulfilled',
+      actor: app.applicant, actorKind: 'system', source: 'waiting',
+      refType: 'waiting', refId: app.id,
+      routeId: app.route_id, instanceId,
+      before: { waitingId: app.id, status: 'waiting' },
+      after: { waitingId: app.id, status: 'fulfilled', instanceId },
+      detail: { waitingId: app.id, instanceId, trigger: reason || 'trigger' },
+      note: `等待申请 #${app.id}（进路 ${app.route_id}，申请人 ${app.applicant}）条件具备，自动兑现为进路实例 #${instanceId}`
+    });
   });
 
   const run = db.transaction(() => {
