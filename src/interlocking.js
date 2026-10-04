@@ -180,11 +180,32 @@ function checkOpen(routeId, switchPositions = {}) {
 /**
  * 开放进路：openRouteInTxn 的事务包装（供直接开放与等待兑现复用同一套
  * 校验+锁闭代码路径）。
+ *
+ * 仅人工直接开放在此顶层事务内追加 route_opened 审计流水（与业务同成同败）；
+ * 等待申请兑现复用 openRouteInTxn 但审计由 waiting.sweepFulfillments 写
+ * waiting_fulfilled，避免一次兑现产生两条流水。
  */
 function openRoute(routeId, switchPositions, clientName) {
   const db = getDb();
-  const instanceId = db.transaction(() =>
-    openRouteInTxn(routeId, switchPositions, clientName))();
+  const instanceId = db.transaction(() => {
+    const id = openRouteInTxn(routeId, switchPositions, clientName);
+    const detail = getInstanceDetail(id);
+    require('./audit').recordRouteOpenedInTxn({
+      instanceId: id,
+      routeId,
+      actor: clientName,
+      before: { routeId, status: 'none', signalState: 'red' },
+      after: {
+        routeId,
+        status: 'open',
+        signalState: 'green',
+        openedBy: clientName,
+        lockedSections: detail.lockedSections,
+        lockedSwitches: detail.lockedSwitches
+      }
+    });
+    return id;
+  })();
   return getInstanceDetail(instanceId);
 }
 
@@ -373,7 +394,8 @@ function submitSectionEvent(instanceId, seq, sectionId, action, clientName) {
 
   const db = getDb();
   const txn = db.transaction(() => {
-    const r = submitSectionEventInTxn(instanceId, seq, sectionId, action, clientName, 'manual');
+    const r = submitSectionEventInTxn(instanceId, seq, sectionId, action, clientName,
+      'manual', { actor: clientName });
     // 人工事件（非幂等重传）抢先改变了走行进度：同事务停止活动定时走行计划，
     // 不覆盖人工结果；幂等重传不重复处理计划。
     if (!r.idempotent) {
@@ -396,8 +418,11 @@ function submitSectionEvent(instanceId, seq, sectionId, action, clientName) {
  * 必须在外层事务/SAVEPOINT 内调用。
  *
  * @param {string} source 'manual' 人工接口 / 'plan' 定时走行计划到期自动注入
+ * @param {{actor?:string, planId?:number}} auditCtx 审计上下文：
+ *        人工提交时 {actor:值班员}；计划注入时 {actor:计划提交人, planId}。
+ *        幂等重传分支提前返回、不写流水。
  */
-function submitSectionEventInTxn(instanceId, seq, sectionId, action, clientName, source = 'manual') {
+function submitSectionEventInTxn(instanceId, seq, sectionId, action, clientName, source = 'manual', auditCtx = null) {
   const db = getDb();
   const inst = getInstance(instanceId);
   const steps = getRouteSteps(inst.route_id);
@@ -459,6 +484,31 @@ function submitSectionEventInTxn(instanceId, seq, sectionId, action, clientName,
       cancellationAborted = require('./cancellation').abortPendingByOccupyInTxn(instanceId);
     }
 
+    // 审计流水（与事件同事务）：人工 actor=值班员；计划注入 actor=计划提交人、
+    // source=system（首段占用还记录被同步终止的延时取消编号）
+    require('./audit').recordRouteEventInTxn({
+      instanceId, routeId: inst.route_id, seq, sectionId, action,
+      actor: auditCtx ? auditCtx.actor : clientName,
+      source: source === 'plan' ? 'system' : 'manual',
+      before: {
+        sectionState: 'free',
+        signalState: inst.signal_state,
+        nextSeq: inst.next_seq,
+        headStep: inst.head_step
+      },
+      after: {
+        sectionState: 'occupied',
+        signalState: step.step_order === 1 ? 'red' : inst.signal_state,
+        nextSeq: inst.next_seq + 1,
+        headStep: inst.head_step + 1
+      },
+      extra: {
+        ...(step.step_order === 1 ? { signalTurnedRed: true } : {}),
+        ...(auditCtx && auditCtx.planId != null ? { planId: auditCtx.planId } : {}),
+        ...(cancellationAborted != null ? { cancellationAborted } : {})
+      }
+    });
+
     return { idempotent: false, instanceId, seq, sectionId, action,
       signalTurnedRed: step.step_order === 1, cancellationAborted };
   }
@@ -494,6 +544,43 @@ function submitSectionEventInTxn(instanceId, seq, sectionId, action, clientName,
        WHERE id=?`
     ).run(instanceId);
     db.prepare(`DELETE FROM route_locks WHERE instance_id=?`).run(instanceId);
+
+    // 审计：末段走行出清事件 + 进路自动解除（同一事务两条流水，同成同败）
+    const audit = require('./audit');
+    audit.recordRouteEventInTxn({
+      instanceId, routeId: inst.route_id, seq, sectionId, action,
+      actor: auditCtx ? auditCtx.actor : clientName,
+      source: source === 'plan' ? 'system' : 'manual',
+      before: {
+        sectionState: 'occupied',
+        signalState: inst.signal_state,
+        nextSeq: inst.next_seq,
+        tailStep: inst.tail_step
+      },
+      after: {
+        sectionState: 'free',
+        signalState: 'red',
+        nextSeq: inst.next_seq + 1,
+        tailStep: inst.tail_step + 1
+      },
+      extra: {
+        routeReleased: true,
+        ...(auditCtx && auditCtx.planId != null ? { planId: auditCtx.planId } : {})
+      }
+    });
+    audit.recordRouteReleasedInTxn({
+      instanceId, routeId: inst.route_id, how: 'walkthrough',
+      actor: auditCtx ? auditCtx.actor : clientName,
+      source: source === 'plan' ? 'system' : 'manual',
+      before: {
+        routeId: inst.route_id, status: 'open', signalState: inst.signal_state,
+        lockedSections: null, tailStep: inst.tail_step
+      },
+      after: {
+        routeId: inst.route_id, status: 'released', signalState: 'red',
+        lockedSections: [], lockedSwitches: []
+      }
+    });
     // 考核计数（同一事务内）：逐段走行【正常解除】才推进当前目标；人工释放/
     // 延时取消解除不经过此路径；幂等重传在上面的历史事件分支已提前返回。
     const examResult = require('./exam').recordWalkthroughReleaseInTxn(instanceId);
@@ -503,6 +590,29 @@ function submitSectionEventInTxn(instanceId, seq, sectionId, action, clientName,
   db.prepare(
     `UPDATE route_instances SET next_seq=next_seq+1, tail_step=tail_step+1 WHERE id=?`
   ).run(instanceId);
+
+  // 审计：非末段出清（逐段解锁）
+  require('./audit').recordRouteEventInTxn({
+    instanceId, routeId: inst.route_id, seq, sectionId, action,
+    actor: auditCtx ? auditCtx.actor : clientName,
+    source: source === 'plan' ? 'system' : 'manual',
+    before: {
+      sectionState: 'occupied',
+      signalState: inst.signal_state,
+      nextSeq: inst.next_seq,
+      tailStep: inst.tail_step
+    },
+    after: {
+      sectionState: 'free',
+      signalState: inst.signal_state,
+      nextSeq: inst.next_seq + 1,
+      tailStep: inst.tail_step + 1
+    },
+    extra: {
+      sectionUnlocked: true,
+      ...(auditCtx && auditCtx.planId != null ? { planId: auditCtx.planId } : {})
+    }
+  });
   return { idempotent: false, instanceId, seq, sectionId, action, sectionUnlocked: true };
 }
 
@@ -514,6 +624,10 @@ function submitSectionEventInTxn(instanceId, seq, sectionId, action, clientName,
  */
 function releaseInstance(instanceId, clientName) {
   const db = getDb();
+  const before = {
+    routeId: null, status: 'open', signalState: null,
+    lockedSections: null, lockedSwitches: null
+  };
   const txn = db.transaction(() => {
     const inst = getInstance(instanceId);
     const steps = getRouteSteps(inst.route_id);
@@ -527,6 +641,14 @@ function releaseInstance(instanceId, clientName) {
         `不能解除：末段区段 ${lastSection} 尚未清空（须按序提交占用/清空事件，末段清空后进路自动解除）`,
         { lastSection });
     }
+    before.routeId = inst.route_id;
+    before.signalState = inst.signal_state;
+    before.lockedSections = db.prepare(
+      `SELECT resource_id FROM route_locks WHERE instance_id=? AND resource_type='section'`
+    ).all(instanceId).map((r) => r.resource_id);
+    before.lockedSwitches = db.prepare(
+      `SELECT resource_id FROM route_locks WHERE instance_id=? AND resource_type='switch'`
+    ).all(instanceId).map((r) => r.resource_id);
     // 末段锁已不存在说明走行已完成，正常应已自动 released；此处兜底完成解除
     db.prepare(
       `UPDATE route_instances SET status='released', released_at=datetime('now') WHERE id=?`
@@ -535,6 +657,16 @@ function releaseInstance(instanceId, clientName) {
     // 人工/兜底解除：同事务停止活动定时走行计划（人工结果保留，不覆盖）
     require('./movement-plan').abortActiveByManualInTxn(
       instanceId, '进路被人工解除，定时走行计划停止；人工结果保留');
+    // 审计：人工解除进路（与解除同事务；校验失败已在上面抛错回滚）
+    require('./audit').recordRouteReleasedInTxn({
+      instanceId, routeId: inst.route_id, how: 'manual',
+      actor: clientName, source: 'manual',
+      before,
+      after: {
+        routeId: inst.route_id, status: 'released', signalState: 'red',
+        lockedSections: [], lockedSwitches: []
+      }
+    });
   });
   txn();
   // 进路解除后资源释放 → 自动尝试兑现等待申请

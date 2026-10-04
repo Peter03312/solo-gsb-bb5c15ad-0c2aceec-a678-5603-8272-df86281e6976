@@ -154,6 +154,12 @@
   - 所有状态保存在本地 SQLite，刷新页面后完全恢复。
 - **角色**：管理员（口令登录，默认 `admin` / `admin123`，可通过环境变量修改）；
   值班员输入姓名即可登录，支持两名及以上值班员同时操作，冲突在服务端仲裁。
+- **站场追溯推演审计流水**：管理员与值班员按当前站场追溯进路开放、走行事件与解除、
+  等待申请兑现、延时取消解除、封锁状态变更、暂停/恢复、检查点回退与站场重置；
+  每条含发生时刻、人工操作者或系统来源、关联编号、变更类型与前后状态摘要，
+  与业务变更**同事务同成同败**；失败操作、幂等重传与未改变状态的扫描不产生条目；
+  回退/重置保留旧流水并写明界标，副本创建后只记录自身的新变化（旧数据不补造历史）；
+  按序号分页、按类型与关联编号筛选，非法筛选明确拒绝，各站场物理隔离不能串看。
 
 ## 技术栈
 
@@ -1276,6 +1282,121 @@ curl -s -X POST http://localhost:3000/api/admin/yards/current/checkpoints/1/roll
 curl -s -X POST http://localhost:3000/api/admin/reset/training -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
+## 站场追溯推演审计流水
+
+管理员和值班员可按**当前所选站场**追溯推演状态变化。每个站场业务库各有一份
+`audit_entries` 审计表，条目在该站场内按 `seq` 严格递增；审计写入与业务变更在
+**同一个数据库事务**内完成——业务回滚则流水回滚，业务成功则流水必在（同成同败）。
+
+**记录的变更类型（只记录真正改变推演状态的业务变更）**
+
+| type | 含义 | refType / refId | 来源 |
+| --- | --- | --- | --- |
+| `route_opened` | 进路开放（人工直接开放） | `route_instance` / 实例号 | 人工 |
+| `route_event` | 走行占用/清空事件（含定时计划注入） | `route_instance` / 实例号 | 人工 / 系统 |
+| `route_released` | 进路解除（末段走行自动解除/人工解除） | `route_instance` / 实例号 | 人工 / 系统 |
+| `waiting_fulfilled` | 等待申请兑现并产生进路实例 | `waiting` / 申请号 | 系统（actor=申请人） |
+| `cancellation_released` | 延时取消核验通过并解除进路 | `cancellation` / 申请号 | 系统 |
+| `blockade_created` | 封锁发起（待生效/已生效） | `blockade` / 申请号 | 人工 |
+| `blockade_changed` | 封锁待生效→已生效 | `blockade` / 申请号 | 系统 |
+| `blockade_ended` | 封锁结束（管理员结束/区段删除自动结束） | `blockade` / 申请号 | 人工 / 系统 |
+| `yard_paused` / `yard_resumed` | 副本暂停 / 恢复 | `yard` / 站场号 | 人工 |
+| `checkpoint_rollback` | 检查点回退（界标） | `checkpoint` / 检查点号 | 人工 |
+| `yard_reset` | 站场重置（清空/培训重开，界标） | `reset` / `state`·`training` | 人工 |
+| `yard_created` | 副本创建界标（仅副本有，恒为该副本 seq=1） | `yard` / 站场号 | 人工 |
+
+每条含：`seq`、`occurredAt` 发生时刻（epoch 毫秒）、`actor` 人工操作者（系统来源为
+`null`）、`source`（`manual`/`system`）、`reason` 系统来源或原因、`refType`+`refId`
+关联编号、`type` 变更类型、`before`/`after` 前后状态摘要、`detail` 附加明细。
+
+**不产生条目的情况**：失败的操作（校验拒绝、争用仲裁失败，事务整体回滚）、
+幂等重传（同号同内容走事件、重复申请封锁/取消、重复暂停/恢复）、以及未改变任何
+状态的定时扫描（等待扫描无人兑现、封锁复核无转换、取消扫描无到期）。
+
+**回退、重置与副本的流水规则**
+
+- 检查点回退：`audit_entries` 不参与快照替换，**此前流水全部保留**，追加一条
+  `checkpoint_rollback` 界标（含检查点编号/名称、平移时长、过期交接单与终止考核），
+  回退后新业务的流水序号在旧序号之上继续递增、不重号。
+- 站场重置：此前流水保留，追加一条 `yard_reset` 界标（`before`/`after` 为重置前后
+  盘面统计）。
+- 创建副本：**不复制**原站场审计流水，新副本流水从 `yard_created` 界标（seq=1）
+  开始，只记录该副本创建后自身的新变化，旧数据不补造历史。
+- 各站场流水物理隔离，接口只作用于会话当前站场，**不能串看其他站场**。
+
+### 审计流水 HTTP API（含调用示例）
+
+**1) 登录**（管理员或值班员均可查询；先选择站场）
+
+```bash
+ADMIN_TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login/admin \
+  -H 'Content-Type: application/json' -d '{"password":"admin123"}' | sed 's/.*"token":"\([^"]*\)".*/\1/')
+DISPATCHER_TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login/dispatcher \
+  -H 'Content-Type: application/json' -d '{"name":"值班员甲"}' | sed 's/.*"token":"\([^"]*\)".*/\1/')
+
+# 选择要追溯的站场（缺省/1=原站场）；流水查询始终只针对当前站场
+curl -s -X PUT http://localhost:3000/api/auth/yard \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"yardId":2}'
+```
+
+**2) 按序号分页查询**（`seq` 递增；默认 `fromSeq=1`、`limit=50`，最大 200）
+
+```bash
+curl -s "http://localhost:3000/api/audit-entries?fromSeq=1&limit=50" \
+  -H "Authorization: Bearer $DISPATCHER_TOKEN"
+```
+
+```json
+{"ok":true,"me":"值班员甲","role":"dispatcher",
+ "yard":{"id":1,"name":"原站场","isOriginal":true,...},
+ "entries":[
+   {"seq":12,"yardId":1,"type":"route_opened","typeLabel":"进路开放",
+    "refType":"route_instance","refTypeLabel":"进路实例","refId":"7",
+    "actor":"值班员甲","source":"manual","reason":null,
+    "before":{"routeId":"R1","status":"none","signalState":"red"},
+    "after":{"routeId":"R1","status":"open","signalState":"green",
+             "lockedSections":["1","3","5"],"lockedSwitches":["SW7","SW8"]},
+    "detail":{"routeId":"R1"},
+    "occurredAt":1790900123456,"createdAt":"2026-10-04 06:41:12"}],
+ "pagination":{"fromSeq":1,"limit":50,"returned":12,
+               "nextFromSeq":13,"hasMore":false},
+ "types":["route_opened","route_event","route_released","waiting_fulfilled",
+          "cancellation_released","blockade_created","blockade_changed",
+          "blockade_ended","yard_paused","yard_resumed","checkpoint_rollback",
+          "yard_reset","yard_created"],
+ "refTypes":["route_instance","waiting","cancellation","blockade",
+             "checkpoint","yard","reset"]}
+```
+
+翻页：用上一页的 `pagination.nextFromSeq` 作为下一页的 `fromSeq`。
+
+**3) 按类型与关联编号筛选**（类型可逗号分隔多选；关联编号精确匹配）
+
+```bash
+# 只看走行事件
+curl -s "http://localhost:3000/api/audit-entries?type=route_event" -H "Authorization: Bearer $ADMIN_TOKEN"
+# 同时看进路开放与等待兑现
+curl -s "http://localhost:3000/api/audit-entries?type=route_opened,waiting_fulfilled" -H "Authorization: Bearer $ADMIN_TOKEN"
+# 追溯某条进路实例（开放+全部走行+解除）
+curl -s "http://localhost:3000/api/audit-entries?refType=route_instance&refId=7" -H "Authorization: Bearer $ADMIN_TOKEN"
+# 追溯某笔封锁的完整生命周期（发起→转换→结束）
+curl -s "http://localhost:3000/api/audit-entries?refType=blockade&refId=3" -H "Authorization: Bearer $ADMIN_TOKEN"
+# 组合：只看某实例的走行事件
+curl -s "http://localhost:3000/api/audit-entries?type=route_event&refType=route_instance&refId=7" -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**4) 非法筛选明确拒绝**：未知类型、非法 `refType`、`fromSeq`/`limit` 非正整数、
+`limit>200`、`refId` 含非法字符，或任何白名单外参数（如 `yardId`）一律
+`400 AUDIT_BAD_FILTER`，不会被静默忽略：
+
+```bash
+curl -s "http://localhost:3000/api/audit-entries?type=not_a_type" -H "Authorization: Bearer $ADMIN_TOKEN"
+# -> 400 {"ok":false,"code":"AUDIT_BAD_FILTER","error":"非法变更类型：not_a_type；允许的类型见响应 types"}
+```
+
+错误：未登录 `401`；暂停的副本仍可查询（只读）。
+
 ## 数据持久化与重置
 
 - **多站场存储**：主库（默认卷内 `/data/interlock.db`）只保存**站场注册表 `yards`
@@ -1337,9 +1458,11 @@ curl -s -X POST http://localhost:3000/api/admin/reset/training -H "Authorization
 │   ├── blockade.js            # 临时封锁（发起/结束/待生效复核/重置清除）
 │   ├── handover.js            # 交接班交接单（生成原子快照/签收同事务比对/过期/重置与重启）
 │   ├── exam.js                # 学员考核（开考/开放登记与偏差/正常解除推进/交卷/暂停冻结用时/回退重置终止）
+│   ├── audit.js               # 审计流水（与业务同事务写入/界标/按当前站场分页与筛选查询）
 │   └── routes/
 │       ├── auth.js            # 登录/登出；GET /auth/yards、PUT /auth/yard 选择当前站场
 │       ├── admin.js           # 含副本创建/暂停恢复、保护时长、封锁、进路批量变更集（预览/发布）、重置（均作用于当前站场）
+│       ├── audit.js           # GET /audit-entries 审计流水查询（管理员与值班员，只读当前站场）
 │       └── api.js             # 值班员接口（只读/预检放行；暂停期间写操作统一拒绝）
 ├── public/                    # 前端页面（顶栏当前站场选择器 + 管理员创建副本入口）
 └── test/
@@ -1353,13 +1476,14 @@ curl -s -X POST http://localhost:3000/api/admin/reset/training -H "Authorization
     ├── pause-http.cjs        # 副本暂停/恢复 HTTP 端到端测试（写操作拒绝/冻结计时/退出撤销/重启/幂等）
     ├── checkpoint-http.cjs   # 检查点 HTTP 端到端测试（创建/重名/回退恢复/交接单过期/序列水位/时间冻结/重启）
     ├── route-changeset-http.cjs # 进路批量变更集 HTTP 端到端测试（预览逐条结果/受影响等待/修订标识/同事务重验/变化拒绝/开放与暂停阻断/重启标识失效）
-    └── exam-http.cjs         # 学员考核 HTTP 端到端测试（开考校验/重复开考/目标推进/偏差不补算/他人不计/幂等/等待兑现与定时走行计入/延时取消不算完成/暂停冻结用时/回退与重置终止/成绩保留重启/跨副本隔离）
+    ├── exam-http.cjs         # 学员考核 HTTP 端到端测试（开考校验/重复开考/目标推进/偏差不补算/他人不计/幂等/等待兑现与定时走行计入/延时取消不算完成/暂停冻结用时/回退与重置终止/成绩保留重启/跨副本隔离）
+    └── audit-http.cjs        # 审计流水 HTTP 端到端测试（九类变更条目/同成同败/幂等与失败不记录/分页与筛选/非法筛选拒绝/回退重置界标保留/副本界标独立/跨站场不串看）
 ```
 
 ## 测试
 
 ```bash
-npm test             # 联锁冒烟 + 等待 + 延时取消 + 临时封锁 + 交接班 + 命名副本 + 定时走行计划 + 暂停恢复 + 检查点 + 进路批量变更集 + 学员考核端到端
+npm test             # 联锁冒烟 + 等待 + 延时取消 + 临时封锁 + 交接班 + 命名副本 + 定时走行计划 + 暂停恢复 + 检查点 + 进路批量变更集 + 学员考核 + 审计流水端到端
 npm run smoke        # 联锁核心规则
 npm run test:waiting# 等待申请提交/撤销/顺位/自动兑现/失效/重启
 npm run test:cancel  # 延时取消申请/重复幂等/到期解除/首段占用终止/区段占用终止/重启/重置
@@ -1371,4 +1495,5 @@ npm run test:pause  # 原站场不可暂停/写操作拒绝/定时任务冻结/�
 npm run test:checkpoint # 检查点创建/重名拒绝/查看摘要/整体回退/交接单过期保留/序列水位不冲突/剩余时间冻结/已到期复核/跨重启
 npm run test:changeset # 进路批量变更集预览/逐条结果/受影响等待/修订标识变化拒绝/开放与暂停阻断/整批原子性/重启标识失效/单条编辑与排路不受影响
 npm run test:exam    # 学员考核：原站场拒考/开考固定/重复开考拒绝/顺序目标推进/偏差不补算/他人不计/幂等重传/等待兑现与定时走行计入/延时取消与人工释放不算完成/暂停冻结有效用时/回退与重置终止/已交卷成绩保留/重启可查/跨副本隔离
+npm run test:audit   # 审计流水：九类变更与前后摘要/同事务同成同败/失败与幂等重传不记录/按序号分页/类型与关联编号筛选/非法筛选 400/回退重置界标保留旧流水/副本 yard_created 独立计数/跨站场不串看
 ```

@@ -95,6 +95,15 @@ function pauseCurrentYard(yardId, operator) {
                   live_since = NULL
             WHERE status='in_progress'`
         ).run(now, now);
+        // 审计：暂停界标写入【该副本业务库】的流水表，与暂停状态同成同败
+        // （yards 行在主库、流水在业务库，跨库 ATTACH 单事务提交）。
+        require('./audit').recordYardPausedInTxn(db, `${alias}.audit_entries`, {
+          yardId,
+          actor: operator,
+          pausedAt: now,
+          before: { status: 'active', paused: false },
+          after: { status: 'paused', paused: true, pausedBy: operator, pausedAt: now }
+        });
       })();
     } finally {
       detach();
@@ -156,6 +165,23 @@ function resumeCurrentYard(yardId, operator) {
                   paused_by=NULL, paused_at=NULL
             WHERE id=? AND status='paused'`
         ).run(operator, now, yardId);
+        // 审计：恢复界标（含平移时长与受影响条目数）写入副本业务库流水表，
+        // 与恢复状态/时间平移同一事务提交。
+        require('./audit').recordYardResumedInTxn(db, `${alias}.audit_entries`, {
+          yardId,
+          actor: operator,
+          resumedAt: now,
+          shiftMs,
+          adjusted: {
+            movementPlanSteps: planResult.changes,
+            cancellations: cancelResult.changes
+          },
+          before: {
+            status: 'paused', paused: true,
+            pausedBy: row.paused_by || null, pausedAt: Number(row.paused_at)
+          },
+          after: { status: 'active', paused: false, resumedBy: operator, resumedAt: now }
+        });
         return { movementPlanSteps: planResult.changes, cancellations: cancelResult.changes };
       })();
       return {

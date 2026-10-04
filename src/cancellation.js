@@ -149,9 +149,10 @@ function abortPendingByOccupyInTxn(instanceId) {
 
 /**
  * 处理单个到期申请（事务体）：在同一事务内重查全部解除条件。
+ * @param {string} trigger 到期处理来源（timer/server_start/yard_copied 等，审计用）
  * @returns {{released:boolean, aborted:boolean, reason?:string}}
  */
-function processOneInTxn(row) {
+function processOneInTxn(row, trigger = 'timer') {
   const db = getDb();
   const now = require('./pause').effectiveNow();
 
@@ -172,6 +173,15 @@ function processOneInTxn(row) {
       `UPDATE cancellation_applications SET status='released', processed_at=?,
               end_reason='进路在到期处理前已解除（走行/人工解除）' WHERE id=?`
     ).run(now, row.id);
+    // 审计：申请收尾为已解除（进路此前已由走行/人工解除并另行记过流水，
+    // 本条只描述取消申请本身的状态变化；already 标记不重复描述进路）
+    require('./audit').recordCancellationReleasedInTxn({
+      cancellationId: row.id, instanceId: row.instance_id, routeId: inst.route_id,
+      already: true,
+      reason: '进路在到期处理前已解除（走行/人工解除），延时取消申请收尾为已解除',
+      before: { cancellationStatus: 'pending', instanceStatus: inst.status },
+      after: { cancellationStatus: 'released', instanceStatus: inst.status }
+    });
     return { released: true, already: true };
   }
 
@@ -214,6 +224,12 @@ function processOneInTxn(row) {
   }
 
   // 5) 全部满足：同一事务内解除进路（信号红、删除全部区段/道岔锁）
+  const lockedSections = db.prepare(
+    `SELECT resource_id FROM route_locks WHERE instance_id=? AND resource_type='section' ORDER BY id`
+  ).all(inst.id).map((r) => r.resource_id);
+  const lockedSwitches = db.prepare(
+    `SELECT resource_id FROM route_locks WHERE instance_id=? AND resource_type='switch' ORDER BY id`
+  ).all(inst.id).map((r) => r.resource_id);
   db.prepare(
     `UPDATE route_instances SET status='released', signal_state='red', released_at=datetime('now')
       WHERE id=?`
@@ -224,6 +240,27 @@ function processOneInTxn(row) {
             end_reason='保护期满且核验通过（进路仍开放、无走行占用、沿途区段均空闲），进路已解除'
       WHERE id=?`
   ).run(now, row.id);
+  // 审计：延时取消核验通过解除进路（系统来源，与解除同事务）。
+  // 进路解除不再另写 route_released，由本条覆盖。
+  require('./audit').recordCancellationReleasedInTxn({
+    cancellationId: row.id, instanceId: inst.id, routeId: inst.route_id,
+    already: false,
+    reason: `保护期满且核验通过（${trigger}），延时取消解除进路`,
+    before: {
+      cancellationStatus: 'pending',
+      instanceStatus: 'open',
+      signalState: inst.signal_state,
+      lockedSections,
+      lockedSwitches
+    },
+    after: {
+      cancellationStatus: 'released',
+      instanceStatus: 'released',
+      signalState: 'red',
+      lockedSections: [],
+      lockedSwitches: []
+    }
+  });
   return { released: true };
 }
 
@@ -242,7 +279,7 @@ function processDue(trigger = 'timer') {
   const released = [];
   const aborted = [];
   for (const row of due) {
-    const txn = db.transaction((r) => processOneInTxn(r));
+    const txn = db.transaction((r) => processOneInTxn(r, trigger));
     let res;
     try {
       res = txn(row);

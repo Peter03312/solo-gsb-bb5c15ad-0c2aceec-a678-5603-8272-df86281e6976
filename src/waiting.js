@@ -252,6 +252,24 @@ function sweepFulfillments(reason) {
               block_reasons='[]', blocked_by=NULL, ended_at=datetime('now')
         WHERE id=?`
     ).run(instanceId, app.id);
+    // 审计：等待申请兑现（系统按序自动兑现）。与兑现同事务：
+    // SAVEPOINT 回滚（兑现失败）时本条一并回滚，不产生流水。
+    const detail = inter.getInstanceDetail(instanceId);
+    require('./audit').recordWaitingFulfilledInTxn({
+      waitingId: app.id,
+      instanceId,
+      routeId: app.route_id,
+      actor: app.applicant,
+      before: { waitingStatus: 'waiting', instanceId: null },
+      after: {
+        waitingStatus: 'fulfilled',
+        instanceId,
+        instanceStatus: 'open',
+        signalState: 'green',
+        lockedSections: detail.lockedSections,
+        lockedSwitches: detail.lockedSwitches
+      }
+    });
     fulfilled.push(app.id);
   });
 

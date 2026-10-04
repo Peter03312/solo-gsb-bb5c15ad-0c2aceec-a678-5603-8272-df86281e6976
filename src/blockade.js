@@ -74,6 +74,14 @@ function refreshBlockadeStates(reason) {
           `UPDATE blockade_applications SET status='active', activated_at=datetime('now')
             WHERE id=?`
         ).run(b.id);
+        // 审计：待生效→已生效（系统复核，与状态转换同事务）。
+        // 没有转换的 pending 不产生条目（未改变状态的扫描不产生新条目）。
+        require('./audit').recordBlockadeChangedInTxn({
+          blockadeId: b.id,
+          sectionId: b.section_id,
+          trigger: reason || 'trigger',
+          after: { sectionId: b.section_id, status: 'active' }
+        });
         activated.push(b.id);
       }
     }
@@ -105,7 +113,7 @@ function submitBlockade(sectionId, rawReason, applicant) {
       `封锁原因过长（最多 ${MAX_REASON_LEN} 字）`);
   }
 
-  const { id, created } = db.transaction(() => {
+  const result = db.transaction(() => {
     const sec = db.prepare(`SELECT id FROM sections WHERE id=?`).get(sid);
     if (!sec) {
       throw new InterlockError(404, 'SECTION_NOT_FOUND',
@@ -116,12 +124,12 @@ function submitBlockade(sectionId, rawReason, applicant) {
     const existing = unfinishedRow(sid);
     if (existing) return { id: existing.id, created: false };
 
+    let info;
     try {
-      const info = db.prepare(
+      info = db.prepare(
         `INSERT INTO blockade_applications(section_id, applicant, reason, status)
          VALUES(?, ?, ?, 'pending')`
       ).run(sid, applicant, reason);
-      return { id: info.lastInsertRowid, created: true };
     } catch (e) {
       // 并发重复申请撞到部分唯一索引：返回已有未结束申请（幂等）
       if (String(e.code) === 'SQLITE_CONSTRAINT_UNIQUE') {
@@ -130,6 +138,17 @@ function submitBlockade(sectionId, rawReason, applicant) {
       }
       throw e;
     }
+    // 审计：封锁发起（与申请入库同事务；重复申请在上面提前返回，不产生条目）。
+    // 提交后若区段空闲会立即复核转已生效，那是另一条 blockade_changed。
+    require('./audit').recordBlockadeCreatedInTxn({
+      blockadeId: info.lastInsertRowid,
+      sectionId: sid,
+      actor: applicant,
+      status: 'pending',
+      reason,
+      after: { sectionId: sid, status: 'pending', reason }
+    });
+    return { id: info.lastInsertRowid, created: true };
   })();
 
   // 提交后立即复核：区段空闲且无进路锁 → 直接转为已生效
@@ -141,7 +160,7 @@ function submitBlockade(sectionId, rawReason, applicant) {
   } catch (e) {
     console.error('[blockade] 提交后等待兑现扫描失败:', e);
   }
-  return { blockade: getBlockade(id), created };
+  return { blockade: getBlockade(result.id), created: result.created };
 }
 
 /* -------------------------------- 结束 -------------------------------- */
@@ -149,8 +168,9 @@ function submitBlockade(sectionId, rawReason, applicant) {
 /**
  * 结束待生效/已生效封锁。结束后按现有联锁规则重试等待兑现；
  * 不改写区段占用状态（区段 occupied/unknown/free 原样保留）。
+ * @param {string|null} operator 操作人；管理员结束传姓名，区段删除自动结束传 null
  */
-function endBlockade(applicationId) {
+function endBlockade(applicationId, operator = '管理员', reasonText) {
   const db = getDb();
   const row = db.prepare(`SELECT * FROM blockade_applications WHERE id=?`).get(applicationId);
   if (!row) {
@@ -160,11 +180,21 @@ function endBlockade(applicationId) {
     throw new InterlockError(409, 'BLOCKADE_NOT_ACTIVE',
       `封锁申请 #${applicationId} 已结束，不能重复结束`);
   }
+  const fromStatus = row.status;
   db.transaction(() => {
     db.prepare(
       `UPDATE blockade_applications SET status='ended', ended_at=datetime('now'),
-              end_reason='管理员结束封锁' WHERE id=?`
-    ).run(applicationId);
+              end_reason=? WHERE id=?`
+    ).run(reasonText || '管理员结束封锁', applicationId);
+    // 审计：封锁结束（与更新同事务；重复结束在上面抛错，不产生条目）
+    require('./audit').recordBlockadeEndedInTxn({
+      blockadeId: applicationId,
+      sectionId: row.section_id,
+      actor: operator,
+      fromStatus,
+      reason: reasonText || '管理员结束封锁',
+      before: { sectionId: row.section_id, status: fromStatus }
+    });
   })();
   // 封锁解除后，此前被封锁阻断的等待申请可能已满足兑现条件
   try {
@@ -179,13 +209,30 @@ function endBlockade(applicationId) {
 
 /**
  * 区段被管理员删除：该区段未结束封锁在同一事务内标记结束（保留记录与原因）。
- * 应在管理员删除区段的事务内调用。
+ * 应在管理员删除区段的事务内调用；审计流水同事务写入（系统来源，actor 为
+ * 执行删除的管理员、原因标明"区段删除自动结束"）。
  */
-function endBySectionDelete(sectionId) {
-  getDb().prepare(
-    `UPDATE blockade_applications SET status='ended', ended_at=datetime('now'),
-            end_reason=? WHERE section_id=? AND status IN ('pending','active')`
-  ).run(`区段 ${sectionId} 已被管理员删除，封锁自动结束`, sectionId);
+function endBySectionDelete(sectionId, operator = '管理员') {
+  const db = getDb();
+  const rows = db.prepare(
+    `SELECT id, status FROM blockade_applications
+      WHERE section_id=? AND status IN ('pending','active')`
+  ).all(sectionId);
+  const reason = `区段 ${sectionId} 已被管理员删除，封锁自动结束`;
+  for (const row of rows) {
+    db.prepare(
+      `UPDATE blockade_applications SET status='ended', ended_at=datetime('now'),
+              end_reason=? WHERE id=?`
+    ).run(reason, row.id);
+    require('./audit').recordBlockadeEndedInTxn({
+      blockadeId: row.id,
+      sectionId,
+      actor: operator,
+      fromStatus: row.status,
+      reason,
+      before: { sectionId, status: row.status }
+    });
+  }
 }
 
 /**

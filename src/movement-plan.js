@@ -306,10 +306,11 @@ function processPlanInTxn(plan) {
     }
 
     // —— 沿用现有事件序号（seq=步号）与走行校验注入；失败只回滚本步 ——
+    // 审计上下文：source=system，actor 为计划提交人（流水可追溯"系统按谁的计划注入"）。
     const attempt = db.transaction(() =>
       require('./interlocking').submitSectionEventInTxn(
         row.instance_id, step.step_order, step.section_id, step.action,
-        planClient(plan.id), 'plan'));
+        planClient(plan.id), 'plan', { actor: row.applicant, planId: plan.id }));
     let injected;
     try {
       injected = attempt();

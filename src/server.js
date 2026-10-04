@@ -9,6 +9,7 @@ const { seedDemo } = require('./seed');
 const authRoutes = require('./routes/auth');
 const adminRoutes = require('./routes/admin');
 const apiRoutes = require('./routes/api');
+const auditRoutes = require('./routes/audit');
 const { InterlockError } = require('./interlocking');
 const waiting = require('./waiting');
 const cancellation = require('./cancellation');
@@ -74,6 +75,7 @@ app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOStri
 
 app.use('/api/auth', authRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api', auditRoutes);
 app.use('/api', apiRoutes);
 
 // 兜底：未匹配的 /api 路径返回 JSON

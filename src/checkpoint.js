@@ -216,6 +216,9 @@ function rollbackToCheckpoint(yardId, checkpointId, operator) {
         `检查点 #${checkpointId} 的快照数据无法解析，回退已取消，副本状态未改变`);
     }
 
+    // 回退前的盘面统计（审计 before；成功写入后本表自身保留旧流水）
+    const beforeSummary = buildSummaryInTxn();
+
     // 1) 清空快照覆盖的业务表（子表在前）
     for (const t of DELETE_TABLES) db.prepare(`DELETE FROM ${t}`).run();
 
@@ -260,6 +263,20 @@ function rollbackToCheckpoint(yardId, checkpointId, operator) {
     // 6) 考核表不参与快照替换：进行中的考核随回退终止并记录原因（已交卷成绩保留）
     const terminatedExamId = require('./exam').terminateActiveInTxn(
       `管理员将副本回退到检查点 #${row.id}「${row.name}」，进行中的考核终止；已交卷成绩保留`);
+
+    // 7) 审计界标（audit_entries 不参与快照替换，回退后旧流水全部保留；
+    //    本条写在同一回退事务内，失败则整体回滚、原状态不变）。
+    const restoredSummary = safeParse(row.summary, {});
+    require('./audit').recordCheckpointRollbackInTxn({
+      checkpointId: row.id,
+      checkpointName: row.name,
+      actor: operator,
+      timeShiftMs: shiftMs,
+      handoversExpired: expired,
+      terminatedExamId,
+      restored: restoredSummary,
+      before: beforeSummary
+    });
 
     return { row, shiftMs, expired, terminatedExamId };
   })();

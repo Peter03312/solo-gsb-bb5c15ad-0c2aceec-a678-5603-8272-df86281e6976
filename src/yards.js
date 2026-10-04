@@ -250,6 +250,16 @@ function createCopyInMainTxn(name, createdBy) {
         `INSERT INTO yards(id,name,kind,source_yard_id,status,db_file,created_by)
          VALUES(?,?, 'copy', ?, 'active', ?, ?)`
       ).run(newId, name, ORIGINAL_YARD_ID, finalFile, createdBy);
+      // 副本创建界标：复制白名单不含 audit_entries，副本流水表为空，
+      // 本条成为副本审计流水 seq=1——之后只记录该副本自身的新变化，
+      // 不为复制来的旧数据补造历史。与复制/注册同一跨库事务，同成同败。
+      require('./audit').recordYardCreatedInTxn(db, `${dstAlias}.audit_entries`, {
+        yardId: newId,
+        name,
+        actor: createdBy,
+        sourceYardId: ORIGINAL_YARD_ID,
+        copied: d.copied
+      });
       return d;
     })();
     detachQuiet();

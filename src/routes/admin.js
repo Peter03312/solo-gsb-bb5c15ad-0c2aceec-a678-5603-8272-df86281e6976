@@ -241,8 +241,8 @@ router.delete('/sections/:id', wrap((req, res) => {
       err.status = 404;
       throw err;
     }
-    // 区段删除：其未结束封锁同事务标记结束（保留记录与原因）
-    blockade.endBySectionDelete(req.params.id);
+    // 区段删除：其未结束封锁同事务标记结束（保留记录与原因，并写审计流水）
+    blockade.endBySectionDelete(req.params.id, req.session.name);
   })();
   res.json({ ok: true });
 }));
@@ -523,11 +523,33 @@ router.get('/blockades', wrap((req, res) => {
 
 // 结束待生效/已生效封锁；结束后按现有联锁规则重试等待兑现（不改写区段占用状态）
 router.post('/blockades/:id/end', wrap((req, res) => {
-  const b = blockade.endBlockade(Number(req.params.id));
+  const b = blockade.endBlockade(Number(req.params.id), req.session.name);
   res.json({ ok: true, blockade: b });
 }));
 
 /* ------------------------------ 推演状态重置 ------------------------------ */
+
+/** 重置前后盘面统计（审计摘要用；在重置事务内调用） */
+function resetSummary() {
+  const db = getDb();
+  const count = (sql) => db.prepare(sql).get().n;
+  return {
+    sections: count(`SELECT COUNT(*) AS n FROM sections`),
+    sectionsOccupied: count(`SELECT COUNT(*) AS n FROM sections WHERE occ_state='occupied'`),
+    sectionsUnknown: count(`SELECT COUNT(*) AS n FROM sections WHERE occ_state='unknown'`),
+    switches: count(`SELECT COUNT(*) AS n FROM switches`),
+    switchesReverse: count(`SELECT COUNT(*) AS n FROM switches WHERE position='R'`),
+    openInstances: count(`SELECT COUNT(*) AS n FROM route_instances WHERE status='open'`),
+    sectionEvents: count(`SELECT COUNT(*) AS n FROM section_events`),
+    waiting: count(`SELECT COUNT(*) AS n FROM waiting_applications WHERE status='waiting'`),
+    pendingCancellations: count(`SELECT COUNT(*) AS n FROM cancellation_applications WHERE status='pending'`),
+    unfinishedBlockades: count(
+      `SELECT COUNT(*) AS n FROM blockade_applications WHERE status IN ('pending','active')`),
+    activeMovementPlans: count(`SELECT COUNT(*) AS n FROM movement_plans WHERE status='active'`),
+    activeHandovers: count(`SELECT COUNT(*) AS n FROM handover_documents WHERE status='active'`),
+    activeExams: count(`SELECT COUNT(*) AS n FROM exams WHERE status='in_progress'`)
+  };
+}
 
 /**
  * 清空推演状态：删除全部进路实例/事件/锁，区段恢复未知（按占用），道岔回定位 N。
@@ -535,6 +557,9 @@ router.post('/blockades/:id/end', wrap((req, res) => {
  */
 router.post('/reset/state', wrap((req, res) => {
   const db = getDb();
+  let expiredHandovers = 0;
+  let terminatedExamId = null;
+  const before = resetSummary();
   db.transaction(() => {
     // 先清除待处理的延时取消申请（随后删除实例也会级联清除，这里显式清理语义清晰）
     cancellation.clearAllByReset();
@@ -550,7 +575,16 @@ router.post('/reset/state', wrap((req, res) => {
     // 站场重置：全部未签收交接单过期（已签收单保留供复盘）
     handover.expireAllActiveByReset('state');
     // 站场重置：进行中的考核终止并记录原因（已交卷成绩保留可查）
-    exam.terminateActiveInTxn('管理员清空推演状态（重置），进行中的考核终止；已交卷成绩保留');
+    terminatedExamId = exam.terminateActiveInTxn('管理员清空推演状态（重置），进行中的考核终止；已交卷成绩保留');
+    expiredHandovers = before.activeHandovers;
+    // 审计界标（与重置同事务；审计表自身不在清除范围内，此前流水保留）
+    require('../audit').recordYardResetInTxn({
+      kind: 'state',
+      actor: req.session.name,
+      before,
+      after: resetSummary(),
+      extra: { expiredHandovers, terminatedExamId }
+    });
   })();
   res.json({ ok: true, state: getState() });
 }));
@@ -561,6 +595,8 @@ router.post('/reset/state', wrap((req, res) => {
  */
 router.post('/reset/training', wrap((req, res) => {
   const db = getDb();
+  let terminatedExamId = null;
+  const before = resetSummary();
   db.transaction(() => {
     cancellation.clearAllByReset();
     movementPlan.clearAllByReset();
@@ -574,7 +610,15 @@ router.post('/reset/training', wrap((req, res) => {
     // 站场重置：全部未签收交接单过期（已签收单保留供复盘）
     handover.expireAllActiveByReset('training');
     // 培训重开（站场重置）：进行中的考核终止并记录原因（已交卷成绩保留）
-    exam.terminateActiveInTxn('管理员执行培训重开（站场重置），进行中的考核终止；已交卷成绩保留');
+    terminatedExamId = exam.terminateActiveInTxn('管理员执行培训重开（站场重置），进行中的考核终止；已交卷成绩保留');
+    // 审计界标（与重置同事务；此前流水保留，自本条起记录重置后的新变化）
+    require('../audit').recordYardResetInTxn({
+      kind: 'training',
+      actor: req.session.name,
+      before,
+      after: resetSummary(),
+      extra: { expiredHandovers: before.activeHandovers, terminatedExamId }
+    });
   })();
   res.json({ ok: true, state: getState() });
 }));

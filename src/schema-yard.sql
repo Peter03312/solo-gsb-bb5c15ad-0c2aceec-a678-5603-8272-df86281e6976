@@ -382,3 +382,46 @@ CREATE TABLE IF NOT EXISTS exam_instances (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_exam_instance_unique
   ON exam_instances(exam_id, instance_id);
 CREATE INDEX IF NOT EXISTS idx_exam_instances_exam ON exam_instances(exam_id, id);
+
+-- 站场追溯推演审计流水（每个站场业务库各自一份，天然隔离、不能串看）：
+--  - 只记录真正改变推演状态的业务变更：进路开放、走行事件与解除、等待申请兑现、
+--    延时取消解除、封锁状态变更、暂停/恢复、检查点回退、站场重置、副本创建界标；
+--  - seq 在本站场内严格递增（INTEGER PRIMARY KEY AUTOINCREMENT），检查点回退、
+--    站场重置都不删除本表、不回退序号，流水按站场递增、可按 seq 顺序分页；
+--  - 每条与对应业务变更在【同一个数据库事务】内写入：业务变更回滚则流水一并回滚，
+--    业务成功而流水缺失不可能出现（同成同败）；
+--  - 失败操作在业务校验阶段抛错回滚、幂等重传走幂等分支、未改变状态的定时扫描，
+--    均不调用写入函数，因此不产生条目；
+--  - 本表不参与检查点快照/回退替换（回退后旧流水保留并追加 checkpoint_rollback
+--    界标条目），创建副本时不复制旧流水（副本只从自身的 yard_created 界标记起，
+--    旧数据不补造历史）。
+CREATE TABLE IF NOT EXISTS audit_entries (
+  seq        INTEGER PRIMARY KEY AUTOINCREMENT, -- 本站场内严格递增的流水序号
+  yard_id    INTEGER,                            -- 写入时的站场编号（冗余展示用）
+  type       TEXT NOT NULL,                      -- 变更类型（见 CHECK 枚举）
+  ref_type   TEXT NOT NULL,                      -- 关联编号类型
+  ref_id     TEXT NOT NULL,                      -- 关联编号（实例/申请/区段/检查点等）
+  actor      TEXT,                               -- 人工操作者姓名；系统来源为 NULL
+  source     TEXT NOT NULL DEFAULT 'manual'
+             CHECK (source IN ('manual','system')),
+  reason     TEXT,                               -- 系统来源或操作原因（人工可空）
+  before_state TEXT,                             -- 变更前状态摘要（JSON）
+  after_state  TEXT,                             -- 变更后状态摘要（JSON）
+  detail     TEXT,                               -- 附加明细（JSON：次要关联编号等）
+  occurred_at INTEGER NOT NULL,                  -- 发生时刻（epoch 毫秒）
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  CHECK (type IN (
+    'route_opened','route_event','route_released',
+    'waiting_fulfilled','cancellation_released',
+    'blockade_created','blockade_changed','blockade_ended',
+    'yard_paused','yard_resumed',
+    'checkpoint_rollback','yard_reset','yard_created'
+  )),
+  CHECK (ref_type IN (
+    'route_instance','waiting','cancellation','blockade',
+    'checkpoint','yard','reset'
+  ))
+);
+CREATE INDEX IF NOT EXISTS idx_audit_type ON audit_entries(type, seq);
+CREATE INDEX IF NOT EXISTS idx_audit_ref ON audit_entries(ref_type, ref_id, seq);
+CREATE INDEX IF NOT EXISTS idx_audit_occurred ON audit_entries(occurred_at);
